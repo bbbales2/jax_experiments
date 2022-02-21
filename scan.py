@@ -7,74 +7,65 @@ import timeit
 N = 10000
 
 # Sum
-def logp_sum(starts, stops, epsilon):
-    total = 0.0
-    for start, stop in zip(starts, stops):
-        total += jax.numpy.sum(epsilon[start:stop])
-    return total
+def logp_sum(epsilon):
+    return jax.numpy.sum(epsilon)
 
 # Accumulation, x[n] = x[n - 1] + epsilon[n]
-def logp_accum(starts, stops, epsilon):
+def logp_accum(epsilon):
     def lag1(carry_x, eps):
         x = carry_x + eps
         return x, x
 
-    total = 0.0
-    for start, stop in zip(starts, stops):
-        carry, y = jax.lax.scan(lag1, 0.0, epsilon[start:stop])
-        total += jax.numpy.sum(y)
-    return total
+    carry, y = jax.lax.scan(lag1, 0.0, epsilon)
+    return jax.numpy.sum(y)
 
 # Trickier accumulation, x[n] = 2 * x[n - 1] - x[n - 2] + epsilon[n]
-def logp_trick_accum(starts, stops, epsilon):
+def logp_trick_accum(epsilon):
     def lag3(carry_x, eps):
         x = 2 * carry_x[0] - carry_x[1] + eps
         return (x, carry_x[0]), x
 
-    total = 0.0
-    for start, stop in zip(starts, stops):
-        carry, y = jax.lax.scan(lag3, (0.0, 0.0), epsilon[start:stop])
-        total += jax.numpy.sum(y)
-    return total
+    carry, y = jax.lax.scan(lag3, (0.0, 0.0), epsilon)
+    return jax.numpy.sum(y)
 
 rng = numpy.random.default_rng()
 
 def time_function(func, epsilon):
     start = time.time()
-    grad = jax.jit(jax.grad(func))
-    grad(epsilon)
-    print(f"Compile time: {time.time() - start} s")
+    grad_vmap = jax.jit(jax.grad(lambda x : jax.numpy.sum(jax.vmap(func)(x))))
+    vmap_grad_val = grad_vmap(epsilon)
+    print(f"Compile time vector: {time.time() - start} s")
 
-    timer = timeit.Timer(lambda : grad(epsilon))
+    start = time.time()
+    def loop_f(epsilon):
+        total = 0.0
+        for i in range(epsilon.shape[0]):
+            total += func(epsilon[i])
+        return total
+    grad_loop = jax.jit(jax.grad(loop_f))
+    loop_grad_val = grad_loop(epsilon)
+    print(f"Compile time loop: {time.time() - start} s")
+
+    print(f"max diff in vmap and loop gradients: {numpy.abs(vmap_grad_val - loop_grad_val).max()}")
+
+    timer = timeit.Timer(lambda : grad_vmap(epsilon))
     number, total_time = timer.autorange()
-    time_per_iteration = timer.timeit(number = number) / number
-    return time_per_iteration * 1e6
+    time_per_iteration_vec = timer.timeit(number = number) / number
 
-epsilon = rng.normal(size = N)
-starts = [0]
-stops = [N]
-print("Scalar timings:")
-print(f"{time_function(partial(logp_sum, starts, stops), epsilon)} us time per sum call")
-print(f"{time_function(partial(logp_accum, starts, stops), epsilon)} us time per accumulate call")
-print(f"{time_function(partial(logp_trick_accum, starts, stops), epsilon)} us time per tricky accumulate call")
+    timer = timeit.Timer(lambda : grad_loop(epsilon))
+    number, total_time = timer.autorange()
+    time_per_iteration_loop = timer.timeit(number = number) / number
 
-M = 5
-epsilon = rng.normal(size = N)
-starts = [0] * M
-stops = [N] * M
-print(f"\nSmall vector ({M}) timings:")
-print(f"{time_function(partial(logp_sum, starts, stops), epsilon)} us time per sum call")
-print(f"{time_function(partial(logp_accum, starts, stops), epsilon)} us time per accumulate call")
-print(f"{time_function(partial(logp_trick_accum, starts, stops), epsilon)} us time per tricky accumulate call")
+    return time_per_iteration_vec * 1e6, time_per_iteration_loop * 1e6
 
-M = 100
-epsilon = rng.normal(size = N)
-starts = [0] * M
-stops = [N] * M
-print(f"\nLarge vector ({M}) timings:")
-print(f"{time_function(partial(logp_sum, starts, stops), epsilon)} us time per sum call")
-print(f"{time_function(partial(logp_accum, starts, stops), epsilon)} us time per accumulate call")
-print(f"{time_function(partial(logp_trick_accum, starts, stops), epsilon)} us time per tricky accumulate call")
+for K in [1, 4, 64]:
+    epsilon = rng.normal(size = K * N).reshape(K, N)
+    starts = numpy.arange(K) * N
+    stops = (numpy.arange(K) + 1) * N
+    print(f"\nTimings: K = {K}:")
+    print(f"{time_function(logp_sum, epsilon)} us (vec, loop) time per sum call")
+    print(f"{time_function(logp_accum, epsilon)} us (vec, loop) time per accumulate call")
+    print(f"{time_function(logp_trick_accum, epsilon)} us (vec, loop) time per tricky accumulate call")
 
 def logp_trick_accum_reference(epsilon):
     N = epsilon.shape[0]
